@@ -5,7 +5,7 @@ import os
 import time
 import datetime
 import requests
-
+import base64
 
 # Initialize OpenAI API client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -36,9 +36,8 @@ def generate_escape_room_adventure(theme, num_riddles=4):
     storyline_result = story_response.choices[0].message.content.strip()
     
     # Parse storyline sections
-    story_sections = {}
+    story_sections = {"Main_Story": ""}
     current_section = "Main_Story"
-    story_sections[current_section] = ""
     
     for line in storyline_result.split('\n'):
         if any(f"Location_{i}:" in line for i in range(1, num_riddles+1)):
@@ -82,32 +81,28 @@ def generate_escape_room_adventure(theme, num_riddles=4):
         
         result = response.choices[0].message.content.strip()
         
-        # Extract riddle, answer, and hint
-        riddle = "A challenging riddle awaits..."
-        answer = "unknown"
-        hint = "Look carefully at the wording of the riddle."
+        # Parse riddle, answer, and hint
+        riddle_parts = {}
+        current_part = None
         
-        if "Riddle:" in result and "Answer:" in result:
-            riddle_parts = result.split("Riddle:")
-            riddle_with_answer = riddle_parts[1].strip()
-            
-            if "Answer:" in riddle_with_answer:
-                riddle_answer_parts = riddle_with_answer.split("Answer:")
-                riddle = riddle_answer_parts[0].strip()
-                answer_with_hint = riddle_answer_parts[1].strip()
-                
-                if "Hint:" in answer_with_hint:
-                    answer_hint_parts = answer_with_hint.split("Hint:")
-                    answer = answer_hint_parts[0].strip().lower()
-                    hint = answer_hint_parts[1].strip()
-                else:
-                    answer = answer_with_hint.strip().lower()
+        for line in result.split('\n'):
+            if line.startswith('Riddle:'):
+                current_part = 'riddle'
+                riddle_parts[current_part] = line.replace('Riddle:', '').strip()
+            elif line.startswith('Answer:'):
+                current_part = 'answer'
+                riddle_parts[current_part] = line.replace('Answer:', '').strip().lower()
+            elif line.startswith('Hint:'):
+                current_part = 'hint'
+                riddle_parts[current_part] = line.replace('Hint:', '').strip()
+            elif current_part:
+                riddle_parts[current_part] += ' ' + line.strip()
         
         riddles.append({
             "location": location,
-            "riddle": riddle,
-            "answer": answer,
-            "hint": hint
+            "riddle": riddle_parts.get('riddle', "A challenging riddle awaits..."),
+            "answer": riddle_parts.get('answer', "unknown"),
+            "hint": riddle_parts.get('hint', "Look carefully at the wording of the riddle.")
         })
     
     return story_sections["Main_Story"], riddles
@@ -140,10 +135,15 @@ def text_to_speech(text):
         response.raise_for_status()  # Raise exception for non-200 status codes
         return response.content
     except requests.exceptions.RequestException as e:
-        print(f"Error calling ElevenLabs API: {e}")
-        if response.content:
-            print(f"Response details: {response.content}")
+        st.error(f"Error calling ElevenLabs API: {e}")
         return None
+
+# Function to create an audio player with the audio data
+def get_audio_player(audio_data):
+    if audio_data:
+        b64 = base64.b64encode(audio_data).decode()
+        return f'<audio autoplay controls><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>'
+    return ""
 
 # Function to set CSS styles including the background image
 def set_styles(image_url):
@@ -163,8 +163,6 @@ def set_styles(image_url):
             border-radius: 12px;
             margin: 20px 0;
             box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
-            display:none;
-
         }}
         .story-box {{
             background-color: white;
@@ -297,6 +295,22 @@ def set_styles(image_url):
             color: #800000; 
             font-weight: bold;
         }}
+        .audio-player {{
+            margin: 15px 0;
+        }}
+        .audio-controls {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background-color: #f0f0f0;
+            padding: 10px;
+            border-radius: 8px;
+            margin-top: 10px;
+        }}
+        .audio-options {{
+            display: flex;
+            gap: 10px;
+        }}
         </style>
         """,
         unsafe_allow_html=True
@@ -321,6 +335,11 @@ def get_timer_class(theme):
         return "timer-mystery"  # default
 
 def reset_session():
+    for key in list(st.session_state.keys()):
+        if key != 'audio_enabled':  # Preserve audio preference
+            del st.session_state[key]
+    
+    # Reinitialize essential session state variables
     st.session_state.game_completed = False
     st.session_state.current_theme = None
     st.session_state.theme_index = 0 
@@ -362,209 +381,339 @@ if "show_hint" not in st.session_state:
     st.session_state.show_hint = False
 if "error_message" not in st.session_state:
     st.session_state.error_message = ""
+if "audio_enabled" not in st.session_state:
+    st.session_state.audio_enabled = True
+if "current_audio" not in st.session_state:
+    st.session_state.current_audio = None
+if "audio_cache" not in st.session_state:
+    st.session_state.audio_cache = {}
 
 # Set styles and the background if we have an image
-set_styles(st.session_state.current_image)
-
-# Add an empty placeholder to hold the reset button
-reset_placeholder = st.empty()
+if st.session_state.current_image:
+    set_styles(st.session_state.current_image)
+else:
+    set_styles("")  # Default empty background
 
 # Create main game container
-st.markdown("<div class='game-container'>", unsafe_allow_html=True)
+main_container = st.container()
 
-# Custom title
-st.markdown("<h1 class='game-title'>The Mind Vault</h1><div class='game-sub-title'>A place of mystery and riddles</div><br/>", unsafe_allow_html=True)
+with main_container:
+    # Custom title
+    st.markdown("<h1 class='game-title'>The Mind Vault</h1><div class='game-sub-title'>A place of mystery and riddles</div><br/>", unsafe_allow_html=True)
 
-# Reset button (positioned outside main flow)
-with reset_placeholder.container():
-    st.markdown("<div class='reset-button-container'>", unsafe_allow_html=True)
-    if st.button("Reset Game"):
-        reset_session()
-    st.markdown("</div>", unsafe_allow_html=True)
+    # Add an empty placeholder to hold the reset button
+    reset_placeholder = st.empty()
 
-# GAME COMPLETED SCREEN
-if st.session_state.game_completed:
-    st.balloons()
-    st.success("Congratulations! You've completed all the riddles!")
-    
-    # Calculate time taken
-    if st.session_state.start_time:
-        time_taken = time.time() - st.session_state.start_time
-        st.markdown(f"<div class='timer-box'><h3>Time taken: {format_time(int(time_taken))}</h3></div>", unsafe_allow_html=True)
-    
-    # Center the start new game button
-    st.markdown("<div class='centered-button'>", unsafe_allow_html=True)
-    if st.button("Start New Game"):    
-        reset_session()
-    st.markdown("</div>", unsafe_allow_html=True)
+    # Reset button (positioned outside main flow)
+    with reset_placeholder.container():
+        st.markdown("<div class='reset-button-container'>", unsafe_allow_html=True)
+        if st.button("Reset Game"):
+            reset_session()
+        st.markdown("</div>", unsafe_allow_html=True)
 
-# ACTIVE GAME SCREEN
-else:
-    # Choose a theme with an empty initial selection
-    theme_choice = st.selectbox("Select a theme", [""] + ["Mystery Mansion", "Ancient Ruins", "Space Odyssey", "Enchanted Forest"], index=st.session_state.theme_index)
-   
-    if theme_choice and (theme_choice != st.session_state.current_theme or not st.session_state.riddles):
-        st.session_state.current_theme = theme_choice
-        st.session_state.start_time = time.time()  # Reset timer when theme changes
-        st.session_state.wrong_attempts = 0  # Reset wrong attempts
-        st.session_state.current_riddle_index = 0  # Reset to first riddle
-        st.session_state.error_message = ""
-        st.session_state.show_hint = False
+    # Toggle for audio narration
+    col1, col2 = st.columns([3, 1])
+    with col2:
+        st.session_state.audio_enabled = st.toggle("Enable Audio Narration", value=st.session_state.audio_enabled)
 
-        # Generate storyline and riddles
-        with st.spinner("Creating your adventure..."):
-            main_story, riddles = generate_escape_room_adventure(theme_choice)
-            st.session_state.main_story = main_story
-            st.session_state.riddles = riddles
-
-        # Generate image
-        with st.spinner("Creating themed background..."):
-            try:
-                image_url = generate_image(theme_choice)
-                st.session_state.current_image = image_url
-                # Refresh the page to apply the background
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error generating image: {str(e)}")
-                st.session_state.current_image = None
-
-    # Display timer if we have a theme
-    if st.session_state.current_theme and st.session_state.start_time:
-        # Calculate time remaining
-        elapsed = time.time() - st.session_state.start_time
-        remaining = max(0, st.session_state.time_limit - int(elapsed))
+    # GAME COMPLETED SCREEN
+    if st.session_state.game_completed:
+        st.balloons()
+        st.success("Congratulations! You've completed all the riddles!")
         
-        # Display themed timer
-        timer_class = get_timer_class(st.session_state.current_theme)
-        st.markdown(f"<div class='timer-box {timer_class}'>Time Remaining: {format_time(remaining)}</div>", unsafe_allow_html=True)
+        # Calculate time taken
+        if st.session_state.start_time:
+            time_taken = time.time() - st.session_state.start_time
+            st.markdown(f"<div class='timer-box'><h3>Time taken: {format_time(int(time_taken))}</h3></div>", unsafe_allow_html=True)
         
-        # Display progress bar
-        progress_percentage = (st.session_state.current_riddle_index / 4) * 100
-        st.markdown(
-            f"""
-            <div class='progress-bar'>
-                <div class='progress-fill' style='width: {progress_percentage}%;'>
-                    {st.session_state.current_riddle_index}/4 Riddles
-                </div>
-            </div>
-            """, 
-            unsafe_allow_html=True
-        )
+        # Generate victory audio
+        if st.session_state.audio_enabled and "victory_audio" not in st.session_state.audio_cache:
+            victory_text = "Congratulations! You've successfully completed all the riddles and escaped the mind vault. Your quick thinking and problem-solving skills have led you to victory!"
+            with st.spinner("Generating audio..."):
+                victory_audio = text_to_speech(victory_text)
+                if victory_audio:
+                    st.session_state.audio_cache["victory_audio"] = victory_audio
+                    st.session_state.current_audio = victory_audio
+        
+        # Play victory audio if available
+        if st.session_state.audio_enabled and "victory_audio" in st.session_state.audio_cache:
+            st.markdown(
+                f"<div class='audio-player'>{get_audio_player(st.session_state.audio_cache['victory_audio'])}</div>",
+                unsafe_allow_html=True
+            )
+        
+        # Center the start new game button
+        st.markdown("<div class='centered-button'>", unsafe_allow_html=True)
+        if st.button("Start New Game"):    
+            reset_session()
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        # Check if time's up
-        if remaining <= 0:
-            st.error("Time's up! You couldn't solve the riddles in time.")
-            st.markdown("<div class='centered-button'>", unsafe_allow_html=True)
-            if st.button("Try Again"):
-                st.session_state.start_time = time.time()  # Reset timer
-                st.session_state.wrong_attempts = 0  # Reset wrong attempts
-                st.session_state.error_message = ""
-                st.session_state.show_hint = False
-                st.rerun()
-            st.markdown("</div>", unsafe_allow_html=True)
-    
-        # Display main story only on the first riddle
-        elif st.session_state.current_riddle_index == 0 and st.session_state.main_story:
-            st.markdown(f"<div class='story-box'><h3>Your Adventure Begins:</h3>{st.session_state.main_story}</div>", unsafe_allow_html=True)
+    # ACTIVE GAME SCREEN
+    else:
+        # Choose a theme with an empty initial selection
+        theme_choice = st.selectbox("Select a theme", [""] + ["Mystery Mansion", "Ancient Ruins", "Space Odyssey", "Enchanted Forest"], index=st.session_state.theme_index)
+       
+        if theme_choice and (theme_choice != st.session_state.current_theme or not st.session_state.riddles):
+            st.session_state.current_theme = theme_choice
+            st.session_state.start_time = time.time()  # Reset timer when theme changes
+            st.session_state.wrong_attempts = 0  # Reset wrong attempts
+            st.session_state.current_riddle_index = 0  # Reset to first riddle
+            st.session_state.error_message = ""
+            st.session_state.show_hint = False
+            st.session_state.audio_cache = {}  # Clear audio cache when theme changes
+
+            # Generate storyline and riddles
+            with st.spinner("Creating your adventure..."):
+                try:
+                    main_story, riddles = generate_escape_room_adventure(theme_choice)
+                    st.session_state.main_story = main_story
+                    st.session_state.riddles = riddles
+                except Exception as e:
+                    st.error(f"Error generating adventure: {str(e)}")
+                    st.session_state.main_story = "An error occurred while creating your adventure."
+                    st.session_state.riddles = []
+
+            # Generate image
+            with st.spinner("Creating themed background..."):
+                try:
+                    image_url = generate_image(theme_choice)
+                    st.session_state.current_image = image_url
+                    # Set styles again with the new image
+                    set_styles(image_url)
+                except Exception as e:
+                    st.error(f"Error generating image: {str(e)}")
+                    st.session_state.current_image = None
+
+            # Generate intro audio if enabled
+            if st.session_state.audio_enabled and st.session_state.main_story:
+                with st.spinner("Generating narration..."):
+                    intro_audio = text_to_speech(st.session_state.main_story)
+                    if intro_audio:
+                        st.session_state.audio_cache["intro"] = intro_audio
+                        st.session_state.current_audio = intro_audio
+
+        # Display timer if we have a theme
+        if st.session_state.current_theme and st.session_state.start_time:
+            # Calculate time remaining
+            elapsed = time.time() - st.session_state.start_time
+            remaining = max(0, st.session_state.time_limit - int(elapsed))
             
-        # Display the current riddle if riddles exist and time remains
-        if st.session_state.riddles and st.session_state.current_riddle_index < len(st.session_state.riddles):
-            current_riddle = st.session_state.riddles[st.session_state.current_riddle_index]
+            # Display themed timer
+            timer_class = get_timer_class(st.session_state.current_theme)
+            st.markdown(f"<div class='timer-box {timer_class}'>Time Remaining: {format_time(remaining)}</div>", unsafe_allow_html=True)
             
-            # Display location story and riddle together
+            # Display progress bar
+            progress_percentage = (st.session_state.current_riddle_index / 4) * 100
             st.markdown(
                 f"""
-                <div class='riddle-box'>
-                    <p class='location-story'>{current_riddle['location']}</p>
-                    <h4>Riddle {st.session_state.current_riddle_index + 1} of 4:</h4>
-                    <p class='riddle-text'>{current_riddle['riddle']}</p>
+                <div class='progress-bar'>
+                    <div class='progress-fill' style='width: {progress_percentage}%;'>
+                        {st.session_state.current_riddle_index}/4 Riddles
+                    </div>
                 </div>
                 """, 
                 unsafe_allow_html=True
             )
-            
-            # Create error message container
-            error_placeholder = st.empty()
 
-            # Display hint if 3 or more wrong attempts
-            if st.session_state.wrong_attempts >= 3:
-                st.markdown(f"<div class='hint-box'><h3>Hint:</h3>{current_riddle['hint']}</div>", unsafe_allow_html=True)
-            
-            # Use placeholder text in input box instead of label
-            user_answer = st.text_input("User Answer", placeholder="Enter your answer here and press Enter...", key=f"answer_input_{st.session_state.current_riddle_index}", label_visibility="collapsed")
-
-            # Display any existing error message
-            if st.session_state.error_message:
-                error_placeholder.markdown(f"""
-                <div class="error-message">
-                {st.session_state.error_message}
-                </div>
-                """, unsafe_allow_html=True)
-               
-            # Check if Enter was pressed (when the input value changes)
-            if user_answer and user_answer != st.session_state.previous_answer:
-                # Store current answer to detect changes
-                st.session_state.previous_answer = user_answer
+            # Check if time's up
+            if remaining <= 0:
+                st.error("Time's up! You couldn't solve the riddles in time.")
                 
-                # Check if answer is correct
-                if user_answer.strip().lower() in current_riddle['answer']:
-                    # Show success message
-                    # st.success("Correct! Moving to the next riddle...")
-                    
-                    # Move to the next riddle
-                    st.session_state.current_riddle_index += 1
-                    st.session_state.wrong_attempts = 0  # Reset wrong attempts for next riddle
-                    st.session_state.previous_answer = ""  # Reset previous answer
-                    st.session_state.error_message = ""   # Clear error message
-                    st.session_state.show_hint = False    # Hide hint for next riddle
-                        
-                    # Check if all riddles are completed
-                    if st.session_state.current_riddle_index >= len(st.session_state.riddles):
-                        st.session_state.game_completed = True
-                    
-                    # Rerun to update the page with new riddle or completion screen
+                # Generate time's up audio
+                if st.session_state.audio_enabled and "times_up" not in st.session_state.audio_cache:
+                    times_up_text = "Time's up! You couldn't solve all the riddles in time. Don't worry, you can try again and see if you can beat the clock."
+                    times_up_audio = text_to_speech(times_up_text)
+                    if times_up_audio:
+                        st.session_state.audio_cache["times_up"] = times_up_audio
+                        st.session_state.current_audio = times_up_audio
+                
+                # Play time's up audio
+                if st.session_state.audio_enabled and "times_up" in st.session_state.audio_cache:
+                    st.markdown(
+                        f"<div class='audio-player'>{get_audio_player(st.session_state.audio_cache['times_up'])}</div>",
+                        unsafe_allow_html=True
+                    )
+                
+                st.markdown("<div class='centered-button'>", unsafe_allow_html=True)
+                if st.button("Try Again"):
+                    st.session_state.start_time = time.time()  # Reset timer
+                    st.session_state.wrong_attempts = 0  # Reset wrong attempts
+                    st.session_state.error_message = ""
+                    st.session_state.show_hint = False
                     st.rerun()
-                else:
-                    # Wrong answer
-                    st.session_state.wrong_attempts += 1
-                    # Update error message based on wrong attempts
-                    if st.session_state.wrong_attempts == 1:
-                        error_message = f"Incorrect! Try again. (Attempt {st.session_state.wrong_attempts})"
-                    elif st.session_state.wrong_attempts == 2:
-                        error_message = f"Incorrect! Try again. (Attempt {st.session_state.wrong_attempts}). One more wrong answer and you'll get a hint!"
-                    elif st.session_state.wrong_attempts >= 3:
-                        error_message = f"Incorrect! Try again. (Attempt {st.session_state.wrong_attempts})"
-                        st.session_state.show_hint = True  # Show hint after 3 wrong attempts
+                st.markdown("</div>", unsafe_allow_html=True)
+        
+            # Display main story only on the first riddle
+            elif st.session_state.current_riddle_index == 0 and st.session_state.main_story:
+                st.markdown(f"<div class='story-box'><h3>Your Adventure Begins:</h3>{st.session_state.main_story}</div>", unsafe_allow_html=True)
+                
+                # Display audio player for main story
+                if st.session_state.audio_enabled and "intro" in st.session_state.audio_cache:
+                    st.markdown(
+                        f"<div class='audio-player'>{get_audio_player(st.session_state.audio_cache['intro'])}</div>",
+                        unsafe_allow_html=True
+                    )
+                
+            # Display the current riddle if riddles exist and time remains
+            if st.session_state.riddles and st.session_state.current_riddle_index < len(st.session_state.riddles):
+                current_riddle = st.session_state.riddles[st.session_state.current_riddle_index]
+                
+                # Generate audio for current riddle if not already in cache
+                riddle_audio_key = f"riddle_{st.session_state.current_riddle_index}"
+                if st.session_state.audio_enabled and riddle_audio_key not in st.session_state.audio_cache:
+                    riddle_text = f"Location: {current_riddle['location']}. Riddle: {current_riddle['riddle']}"
+                    with st.spinner("Generating riddle narration..."):
+                        riddle_audio = text_to_speech(riddle_text)
+                        if riddle_audio:
+                            st.session_state.audio_cache[riddle_audio_key] = riddle_audio
+                            st.session_state.current_audio = riddle_audio
+                
+                # Display location story and riddle together
+                st.markdown(
+                    f"""
+                    <div class='riddle-box'>
+                        <p class='location-story'>{current_riddle['location']}</p>
+                        <h4>Riddle {st.session_state.current_riddle_index + 1} of 4:</h4>
+                        <p class='riddle-text'>{current_riddle['riddle']}</p>
+                    </div>
+                    """, 
+                    unsafe_allow_html=True
+                )
+                
+                # Play riddle audio
+                if st.session_state.audio_enabled and riddle_audio_key in st.session_state.audio_cache:
+                    st.markdown(
+                        f"<div class='audio-player'>{get_audio_player(st.session_state.audio_cache[riddle_audio_key])}</div>",
+                        unsafe_allow_html=True
+                    )
+                
+                # Create error message container
+                error_placeholder = st.empty()
+
+                # Display hint if 3 or more wrong attempts
+                if st.session_state.wrong_attempts >= 3:
+                    st.markdown(f"<div class='hint-box'><h3>Hint:</h3>{current_riddle['hint']}</div>", unsafe_allow_html=True)
                     
+                    # Generate hint audio if not already cached
+                    hint_audio_key = f"hint_{st.session_state.current_riddle_index}"
+                    if st.session_state.audio_enabled and hint_audio_key not in st.session_state.audio_cache:
+                        hint_text = f"Here's a hint: {current_riddle['hint']}"
+                        with st.spinner("Generating hint narration..."):
+                            hint_audio = text_to_speech(hint_text)
+                            if hint_audio:
+                                st.session_state.audio_cache[hint_audio_key] = hint_audio
+                                st.session_state.current_audio = hint_audio
+                    
+                    # Play hint audio
+                    if st.session_state.audio_enabled and hint_audio_key in st.session_state.audio_cache:
+                        st.markdown(
+                            f"<div class='audio-player'>{get_audio_player(st.session_state.audio_cache[hint_audio_key])}</div>",
+                            unsafe_allow_html=True
+                        )
+                
+                # Use placeholder text in input box instead of label
+                user_answer = st.text_input("User Answer", placeholder="Enter your answer here and press Enter...", key=f"answer_input_{st.session_state.current_riddle_index}", label_visibility="collapsed")
+
+                # Display any existing error message
+                if st.session_state.error_message:
                     error_placeholder.markdown(f"""
                     <div class="error-message">
-                    {error_message}
+                    {st.session_state.error_message}
                     </div>
                     """, unsafe_allow_html=True)
+                   
+                # Check if Enter was pressed (when the input value changes)
+                if user_answer and user_answer != st.session_state.previous_answer:
+                    # Store current answer to detect changes
+                    st.session_state.previous_answer = user_answer
                     
-                    # Display error immediately and also save to session state
-                    st.session_state.error_message = error_message
+                    # Check if answer is correct (case insensitive and multiple potential answers)
+                    user_answer_lower = user_answer.strip().lower()
+                    correct_answers = [ans.strip().lower() for ans in current_riddle['answer'].split(',')]
                     
-                    # Show hint after 3 wrong attempts
-                    if st.session_state.wrong_attempts >= 3:
-                        st.session_state.show_hint = True
-                        st.rerun()  # Only rerun if we need to show a hint
-
-    # Add auto-refresh mechanism for timer updates using Streamlit's native approach
-    if st.session_state.current_theme and st.session_state.start_time and not st.session_state.game_completed:
-        # Create an empty element that will trigger a rerun
-        placeholder = st.empty()
-        
-        # Only rerun if there's time left
-        elapsed = time.time() - st.session_state.start_time
-        remaining = max(0, st.session_state.time_limit - int(elapsed))
-        
-        if remaining > 0:
-            # Wait for a short time, then rerun
-            time.sleep(1)
-            st.rerun()
-
-st.markdown("</div>", unsafe_allow_html=True)
-
-# Add a high-contrast attribution/footer
-st.markdown("<p class='high-contrast-text' style='text-align: center; margin-top: 20px;'>The Mind Vault - Escape Room &copy; 2025</p>", unsafe_allow_html=True)
+                    if any(user_answer_lower == ans or user_answer_lower in ans for ans in correct_answers):
+                        # Generate correct answer audio
+                        if st.session_state.audio_enabled and "correct_answer" not in st.session_state.audio_cache:
+                            correct_text = "Correct! Moving to the next challenge."
+                            with st.spinner("Generating audio..."):
+                                correct_audio = text_to_speech(correct_text)
+                                if correct_audio:
+                                    st.session_state.audio_cache["correct_answer"] = correct_audio
+                                    st.session_state.current_audio = correct_audio
+                        
+                        # Move to the next riddle
+                        st.session_state.current_riddle_index += 1
+                        st.session_state.wrong_attempts = 0  # Reset wrong attempts for next riddle
+                        st.session_state.previous_answer = ""  # Reset previous answer
+                        st.session_state.error_message = ""   # Clear error message
+                        st.session_state.show_hint = False    # Hide hint for next riddle
+                            
+                        # Check if all riddles are completed
+                        if st.session_state.current_riddle_index >= len(st.session_state.riddles):
+                            st.session_state.game_completed = True
+                        
+                        # Rerun to update the page with new riddle or completion screen
+                        st.rerun()
+                    else:
+                        # Wrong answer
+                        st.session_state.wrong_attempts += 1
+                        
+                        # Generate wrong answer audio if not already cached
+                        wrong_audio_key = f"wrong_{min(st.session_state.wrong_attempts, 3)}"
+                        if st.session_state.audio_enabled and wrong_audio_key not in st.session_state.audio_cache:
+                            wrong_messages = [
+                                "That's not correct. Try again!",
+                                "Not quite right. Give it another try.",
+                                "Still not correct. Think carefully about the riddle. A hint will appear soon."
+                            ]
+                            wrong_text = wrong_messages[min(st.session_state.wrong_attempts, 3) - 1]
+                            with st.spinner("Generating audio..."):
+                                wrong_audio = text_to_speech(wrong_text)
+                                if wrong_audio:
+                                    st.session_state.audio_cache[wrong_audio_key] = wrong_audio
+                                    st.session_state.current_audio = wrong_audio
+                        
+                        # Set error message
+                        if st.session_state.wrong_attempts >= 3:
+                            st.session_state.error_message = "That's not correct. A hint has been provided above."
+                            st.session_state.show_hint = True
+                        else:
+                            st.session_state.error_message = f"That's not correct. Try again! ({st.session_state.wrong_attempts}/3 attempts)"
+                        
+                        # Play wrong answer audio
+                        if st.session_state.audio_enabled and wrong_audio_key in st.session_state.audio_cache:
+                            st.markdown(
+                                f"<div class='audio-player'>{get_audio_player(st.session_state.audio_cache[wrong_audio_key])}</div>",
+                                unsafe_allow_html=True
+                            )
+                        
+                        # Force a rerun to show the updated error message
+                        st.rerun()
+        elif not theme_choice:
+            # No theme selected yet
+            st.markdown(
+                """
+                <div class="game-container">
+                    <h2>Welcome to The Mind Vault</h2>
+                    <p>Select a theme above to begin your escape room adventure!</p>
+                    <ul>
+                        <li><strong>Mystery Mansion</strong>: Solve riddles in a haunted Victorian mansion</li>
+                        <li><strong>Ancient Ruins</strong>: Uncover secrets in forgotten temple ruins</li>
+                        <li><strong>Space Odyssey</strong>: Navigate puzzles on an abandoned space station</li>
+                        <li><strong>Enchanted Forest</strong>: Decode magical riddles in a mystical woodland</li>
+                    </ul>
+                    <p>You'll have 5 minutes to solve all four riddles and escape!</p>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+            
+            # Store theme index for future use
+            if theme_choice:
+                themes = ["Mystery Mansion", "Ancient Ruins", "Space Odyssey", "Enchanted Forest"]
+                if theme_choice in themes:
+                    st.session_state.theme_index = themes.index(theme_choice) + 1  # +1 because index 0 is empty
+            
+            # Reset timer and progress when no theme is selected
+            st.session_state.start_time = None
+            st.session_state.current_riddle_index = 0
